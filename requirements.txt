@@ -1,5 +1,4 @@
-langgraph>=1.2
-langchain>=1.1
-langchain-google-genai>=4.2
-python-dotenv>=1.0
-pytest>=8.0
+langgraph
+langchain
+langchain-google-genai
+pytest

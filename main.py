@@ -1,59 +1,102 @@
-from dotenv import load_dotenv
+import argparse
+import sys
+import json
+import difflib
+import os
+from src.workflow import create_workflow
 
-load_dotenv()  # must run before importing anything that builds an LLM client
+def generate_diff(original: str, modified: str, filename: str) -> str:
+    orig_lines = original.splitlines(keepends=True)
+    mod_lines = modified.splitlines(keepends=True)
 
-from pathlib import Path
-
-from src.ingestor import CodeIngestor
-from src.workflow import auditing_graph
-
-DATA_FILE = Path(__file__).resolve().parent / "data" / "flawed_script.py"
-
-# Which function from flawed_script.py to run through the pipeline.
-TARGET_FUNCTION = "find_duplicates"
-
+    diff = difflib.unified_diff(
+        orig_lines,
+        mod_lines,
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+    )
+    return "".join(diff)
 
 def main():
-    source = DATA_FILE.read_text()
-    functions = CodeIngestor.extract_functions(source)
+    parser = argparse.ArgumentParser(description="CodeGuardian: Stateful Multi-Agent Code Review & Refactoring Engine")
+    parser.add_argument("--file", type=str, required=True, help="Path to the target python file")
+    parser.add_argument("--test-file", type=str, help="Path to an optional pytest file for validation")
+    parser.add_argument("--retries", type=int, default=3, help="Max validation loop retries")
+    parser.add_argument("--report", action="store_true", help="Emit a structured JSON report")
 
-    if TARGET_FUNCTION not in functions:
-        raise ValueError(f"'{TARGET_FUNCTION}' not found in {DATA_FILE}")
+    args = parser.parse_args()
 
-    initial_state = CodeIngestor.initialize_state(functions[TARGET_FUNCTION])
+    if not os.path.exists(args.file):
+        print(f"Error: Target file {args.file} not found.")
+        sys.exit(1)
 
-    print("=" * 70)
-    print(f"STARTING GRAPH for function: {TARGET_FUNCTION}")
-    print("=" * 70)
+    with open(args.file, "r") as f:
+        original_code = f.read()
+
+    test_code = ""
+    if args.test_file:
+        if not os.path.exists(args.test_file):
+            print(f"Error: Test file {args.test_file} not found.")
+            sys.exit(1)
+        with open(args.test_file, "r") as f:
+            test_code = f.read()
+
+    app = create_workflow()
+
+    initial_state = {
+        "source_code": original_code,
+        "test_code": test_code,
+        "ast_context": {},
+        "review_feedback": "",
+        "test_output": "",
+        "retry_count": 0,
+        "max_retries": args.retries,
+        "final_status": ""
+    }
+
+    print(f"Running CodeGuardian on {args.file}...")
 
     final_state = None
+    for s in app.stream(initial_state):
+        if "ast" in s:
+            print("=> AST Parsing Complete")
+        if "critic" in s:
+            print("=> Critic Review Complete")
+        if "coder" in s:
+            print("=> Coder Refactoring Applied")
+        if "validator" in s:
+            print(f"=> Validator Run Complete (Status: {s['validator'].get('final_status')})")
+        final_state = s
 
-    # .stream() yields a dict after each node finishes, keyed by node name.
-    # This lets us watch the state mutate step by step, including any
-    # retry loop, instead of only seeing the final result.
-    for step in auditing_graph.stream(initial_state):
-        for node_name, node_output in step.items():
-            print(f"\n--- NODE COMPLETED: {node_name} ---")
-            if node_name == "auditor":
-                print("Latest feedback:\n", node_output["feedback_history"][-1][:300], "...")
-            elif node_name == "fixer":
-                print(f"iteration_count -> {node_output['iteration_count']}")
-                print("refactored_code (first 200 chars):\n", node_output["refactored_code"][:200])
-            elif node_name == "tester":
-                status = "PASS" if node_output["linting_errors"] is None else "FAIL"
-                print(f"Tester result: {status}")
-                if status == "FAIL":
-                    print("Error:", node_output["linting_errors"])
-            final_state = node_output
+    if not final_state:
+        print("Error: Workflow did not return a state.")
+        sys.exit(1)
 
-    print("\n" + "=" * 70)
-    print("GRAPH FINISHED")
-    print("=" * 70)
-    print("Final iteration_count:", final_state.get("iteration_count"))
-    print("Final linting_errors:", final_state.get("linting_errors"))
-    print("\nFinal refactored_code:\n")
-    print(final_state.get("refactored_code"))
+    # Get the last state correctly whether it's wrapped or unwrapped depending on langgraph version
+    state_values = final_state[list(final_state.keys())[0]] if hasattr(final_state, "keys") else final_state
 
+    new_code = state_values.get("source_code", "")
+
+    print("\n--- Unified Diff ---")
+    diff = generate_diff(original_code, new_code, os.path.basename(args.file))
+    print(diff if diff else "No changes made.")
+
+    if state_values.get("final_status") == "success":
+        print("\nSUCCESS: Code passed all validation steps.")
+    else:
+        print(f"\nFAILED: Code did not pass validation after {state_values.get('retry_count')} retries.")
+
+    if args.report:
+        report = {
+            "file": args.file,
+            "status": state_values.get("final_status"),
+            "retries": state_values.get("retry_count"),
+            "feedback": state_values.get("review_feedback"),
+            "test_output": state_values.get("test_output")
+        }
+        with open("codeguardian_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        print("\nReport saved to codeguardian_report.json")
 
 if __name__ == "__main__":
     main()
